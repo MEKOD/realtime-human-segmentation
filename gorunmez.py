@@ -2,157 +2,200 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-# ---------- AYARLAR (HARDCORE MOD) ----------
+
+# =========================
+# CONFIG
+# =========================
 CAM_INDEX = 0
-BG_FRAMES = 60
+WARMUP_FRAMES = 60          # background capture frames (stay out of frame)
+BG_UPDATE_ALPHA = 0.03      # background EMA update speed (small = stable)
+SEG_MODEL = 1               # 0 = general, 1 = landscape (often better)
 
-ALPHA_BG = 0.04          # Arka plan daha yavaş değişsin (stabilite için)
-MASK_BLUR = 15           # Biraz daha fazla blur
-MASK_THRESH = 0.45       # Daha agresif silme (gürültü istemiyoruz)
-EDGE_FEATHER = 9         # Kenar yumuşatma arttırıldı
+# Mask cleanup
+MASK_BLUR = 13              # gaussian blur on raw mask
+MASK_THRESH = 0.45          # threshold for person mask
+DILATE_ITER = 1             # close finger gaps a bit
+DILATE_KSIZE = 5
+FEATHER_BLUR = 9            # soften edges
 
-MASK_TEMPORAL = 0.85     # Çok yüksek stabilizasyon (titreme yok)
-BASE_OPACITY = 0.08      # %8 Görünürlük (neredeyse yoksun)
-MOTION_THRESH = 10.0     # Bu hareket değerini geçersen %0 olursun
-# -------------------------------------------
+# Temporal stabilization
+MASK_TEMPORAL = 0.85        # higher = less jitter, more lag (0..1)
 
-cap = cv2.VideoCapture(CAM_INDEX)
-if not cap.isOpened():
-    raise RuntimeError("Kamera açılamadı.")
+# Cloak behavior
+BASE_OPACITY = 0.08         # default visibility (0 = invisible, 1 = normal)
+MOTION_TO_INVIS = 10.0      # if motion score exceeds -> opacity goes to 0
+MOTION_SMOOTH = 0.8         # smooth motion score to avoid flicker (0..1)
 
-# Model selection 1 (Landscape) daha iyi çalışır
-mp_seg = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+# UI
+WINDOW_NAME = "Cloak"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-bg = None
-bg_count = 0
-prev_mask = None
-cloak_enabled = True
 
-print("HAZIRLIK: İlk 60 karede ekrandan çık! (Arka plan öğreniliyor)")
-print("Kontroller: 'c': Cloak Aç/Kapa | 'r': Reset BG | ESC: Çıkış")
+# =========================
+# HELPERS
+# =========================
+def odd(n: int) -> int:
+    return n if n % 2 == 1 else n + 1
 
-# Dilation (genişletme) için kernel
-dilate_kernel = np.ones((5, 5), np.uint8)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
-    frame = cv2.flip(frame, 1)
-    frame_float = frame.astype(np.float32)
 
-    if bg is None:
-        bg = frame_float.copy()
+# =========================
+# MAIN
+# =========================
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError("Kamera açılamadı. CAM_INDEX yanlış olabilir.")
 
-    # ---------- 1. ARKA PLAN ÖĞRENME ----------
-    if bg_count < BG_FRAMES:
-        cv2.accumulateWeighted(frame_float, bg, 0.2)
-        bg_count += 1
-        
-        # Yükleme ekranı
-        vis = frame.copy()
-        cv2.rectangle(vis, (0,0), (frame.shape[1], frame.shape[0]), (0,0,0), -1)
-        loading_w = int((bg_count / BG_FRAMES) * 400)
-        cv2.rectangle(vis, (120, 220), (120 + loading_w, 260), (0, 255, 0), -1)
-        cv2.putText(vis, "SISTEM YUKLENIYOR - KADRAJDAN CIK", (80, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow("Ghost Terminal v2", vis)
-        
-        if cv2.waitKey(1) & 0xFF == 27:
+    mp_seg = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=SEG_MODEL)
+
+    bg = None
+    warmup = 0
+    prev_mask = None
+    cloak_enabled = True
+
+    # motion smoothing (EMA)
+    motion_ema = 0.0
+
+    dilate_kernel = np.ones((DILATE_KSIZE, DILATE_KSIZE), np.uint8)
+
+    print("Controls:  [c] cloak on/off   [r] recapture background   [esc] quit")
+    print(f"Warmup: stay out of frame for first {WARMUP_FRAMES} frames...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
             break
-        continue
 
-    bg8 = bg.astype(np.uint8)
+        frame = cv2.flip(frame, 1)
+        frame_f = frame.astype(np.float32)
 
-    # ---------- 2. HAREKET ANALİZİ (DYNAMIC OPACITY) ----------
-    # Arka plan ile şu anki kare arasındaki fark (Motion)
-    diff = cv2.absdiff(frame, bg8)
-    motion_score = np.mean(diff)
+        if bg is None:
+            bg = frame_f.copy()
 
-    # Eğer çok hareket varsa (motion > 10), tamamen yok ol (0.0)
-    # Değilse varsayılan hayalet modunda kal (0.08)
-    if motion_score > MOTION_THRESH:
-        current_opacity = 0.0
-        status_sub = "MODE: ACTIVE CAMO (MOVING)"
-    else:
-        current_opacity = BASE_OPACITY
-        status_sub = "MODE: GHOST (IDLE)"
+        # -------------------------
+        # BACKGROUND WARMUP CAPTURE
+        # -------------------------
+        if warmup < WARMUP_FRAMES:
+            cv2.accumulateWeighted(frame_f, bg, 0.20)
+            warmup += 1
 
-    # ---------- 3. SEGMENTASYON ----------
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    res = mp_seg.process(rgb)
-    mask = res.segmentation_mask
+            vis = frame.copy()
+            # minimal overlay
+            cv2.putText(
+                vis,
+                f"Capturing background... {warmup}/{WARMUP_FRAMES} (step out)",
+                (16, 34),
+                FONT,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(WINDOW_NAME, vis)
 
-    # a) Maskeyi biraz temizle
-    mask = cv2.GaussianBlur(mask, (MASK_BLUR | 1, MASK_BLUR | 1), 0)
-    
-    # b) Eşikleme (Threshold)
-    mask = (mask > MASK_THRESH).astype(np.float32)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                break
+            continue
 
-    # c) GÖLGE VE KOYU ALANLARI MASKEYE EKLEME (Kritik)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Çok koyu alanları (gölge gibi) maskeye dahil et ki orayı da arka planla boyasın
-    shadow_mask = (gray < 60).astype(np.float32)
-    # Gölge maskesini ana maskeye hafifçe yediriyoruz
-    mask = np.clip(mask + 0.3 * shadow_mask, 0.0, 1.0)
+        # Convert background to uint8 for mixing/diff
+        bg8 = bg.astype(np.uint8)
 
-    # d) DILATION (Genişletme) - Parmak aralarını kapatır
-    mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+        # -------------------------
+        # PERSON SEGMENTATION
+        # -------------------------
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = mp_seg.process(rgb)
+        mask = res.segmentation_mask  # float [0..1] HxW
 
-    # ---------- 4. TEMPORAL STABILIZATION (Titreşimi Kes) ----------
-    if prev_mask is None:
+        # smooth raw mask
+        mask = cv2.GaussianBlur(mask, (odd(MASK_BLUR), odd(MASK_BLUR)), 0)
+
+        # threshold -> binary-ish
+        mask = (mask > MASK_THRESH).astype(np.float32)
+
+        # dilate to cover small gaps (fingers, edges)
+        if DILATE_ITER > 0:
+            mask = cv2.dilate(mask, dilate_kernel, iterations=DILATE_ITER).astype(np.float32)
+
+        # temporal smoothing (EMA)
+        if prev_mask is None:
+            prev_mask = mask
+        mask = (MASK_TEMPORAL * prev_mask + (1.0 - MASK_TEMPORAL) * mask).astype(np.float32)
         prev_mask = mask
-    mask = MASK_TEMPORAL * prev_mask + (1 - MASK_TEMPORAL) * mask
-    prev_mask = mask
 
-    # e) FEATHER (Yumuşak Geçiş)
-    mask = cv2.GaussianBlur(mask, (EDGE_FEATHER | 1, EDGE_FEATHER | 1), 0)
-    mask3 = mask[..., None]
+        # feather edges
+        mask = cv2.GaussianBlur(mask, (odd(FEATHER_BLUR), odd(FEATHER_BLUR)), 0)
+        mask = np.clip(mask, 0.0, 1.0)
+        mask3 = mask[..., None]
 
-    # ---------- 5. ARKA PLAN GÜNCELLEME (Sinsi Mod) ----------
-    # Sadece maskenin olmadığı (senin olmadığın) yerleri çok yavaş güncelle
-    inv_mask = 1.0 - mask3
-    bg = bg * (1 - ALPHA_BG * inv_mask) + frame_float * (ALPHA_BG * inv_mask)
-    bg8 = bg.astype(np.uint8)
+        # -------------------------
+        # MOTION (ONLY INSIDE PERSON)
+        # -------------------------
+        # Use diff only where mask is present -> avoids background flicker driving opacity
+        diff = cv2.absdiff(frame, bg8).astype(np.float32)
+        # Convert diff to scalar motion score inside person area
+        person_area = mask3
+        denom = float(np.sum(mask) + 1e-6)
+        motion_score = float(np.sum(np.mean(diff, axis=2) * mask) / denom)
 
-    # ---------- 6. CLOAK RENDER ----------
-    if cloak_enabled:
-        # Formül: (Sen * Opacity) + (Arka Plan * (1-Opacity))
-        # Maskenin olduğu bölgeyi bu karışımla doldur
-        cloak_area = (frame_float * current_opacity) + (bg.astype(np.float32) * (1 - current_opacity))
-        
-        # Son birleştirme
-        out = (cloak_area * mask3 + frame_float * (1 - mask3)).astype(np.uint8)
-    else:
-        out = frame.copy()
-        status_sub = "SYSTEM OFF"
+        motion_ema = MOTION_SMOOTH * motion_ema + (1.0 - MOTION_SMOOTH) * motion_score
 
-    # ---------- 7. HUD (HEADS UP DISPLAY) ----------
-    # Matrix yeşili arayüz
-    cv2.putText(out, "GHOST TERMINAL v2.0", (20, 40), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
-    color_st = (0, 255, 0) if cloak_enabled else (0, 0, 255)
-    cv2.putText(out, status_sub, (20, out.shape[0] - 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_st, 2)
+        # opacity rule
+        current_opacity = 0.0 if motion_ema > MOTION_TO_INVIS else BASE_OPACITY
+        current_opacity = clamp(current_opacity, 0.0, 1.0)
 
-    # Hareket barı (Opsiyonel debug)
-    cv2.rectangle(out, (out.shape[1]-20, out.shape[0]-10), 
-                  (out.shape[1]-10, out.shape[0]-10 - int(motion_score*3)), (0, 255, 255), -1)
+        # -------------------------
+        # BACKGROUND UPDATE (ONLY NON-PERSON)
+        # -------------------------
+        inv = 1.0 - mask3
+        bg = bg * (1.0 - BG_UPDATE_ALPHA * inv) + frame_f * (BG_UPDATE_ALPHA * inv)
 
-    cv2.imshow("Ghost Terminal v2", out)
+        # -------------------------
+        # RENDER
+        # -------------------------
+        if cloak_enabled:
+            # Blend inside person mask:
+            # out = mask*(opacity*frame + (1-opacity)*bg) + (1-mask)*frame
+            cloak_mix = frame_f * current_opacity + bg * (1.0 - current_opacity)
+            out = (cloak_mix * mask3 + frame_f * (1.0 - mask3)).astype(np.uint8)
+        else:
+            out = frame.copy()
 
-    # ---------- KONTROLLER ----------
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27: # ESC
-        break
-    if key == ord('r'):
-        bg = frame_float.copy()
-        bg_count = 0
-        prev_mask = None
-    if key == ord('c'):
-        cloak_enabled = not cloak_enabled
+        # -------------------------
+        # MINIMAL STATUS OVERLAY
+        # -------------------------
+        status = "CLOAK ON" if cloak_enabled else "CLOAK OFF"
+        cv2.putText(out, status, (16, out.shape[0] - 16), FONT, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-cap.release()
-cv2.destroyAllWindows()
+        # optional tiny debug (comment out if you want ultra-clean)
+        cv2.putText(out, f"motion:{motion_ema:.1f}  opacity:{current_opacity:.2f}", (16, 60),
+                    FONT, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        cv2.imshow(WINDOW_NAME, out)
+
+        # -------------------------
+        # KEYS
+        # -------------------------
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            break
+        elif key == ord("c"):
+            cloak_enabled = not cloak_enabled
+        elif key == ord("r"):
+            # recapture background
+            bg = frame_f.copy()
+            warmup = 0
+            prev_mask = None
+            motion_ema = 0.0
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
